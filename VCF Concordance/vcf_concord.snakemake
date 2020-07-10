@@ -1,0 +1,105 @@
+## 
+## Load python modules
+##
+import os
+from os import listdir
+from os.path import join
+import pandas as pd
+import re
+import sys
+from glob import glob
+import datetime
+
+oldVCF = os.environ.get("OLDVCF")
+print("Old VCF: " + oldVCF)
+
+currVCF = os.environ.get("CURRVCF")
+print("Current VCF: " + currVCF)
+
+shared_samples_file = open("common_vcf_samples.txt", "r")
+shared_samples = shared_samples_file.read().split("\n")
+shared_samples.remove('')
+
+configfile:"processing_references.json"
+curr_dir = os.getcwd()
+print(curr_dir)
+
+rule all:
+    input:
+        multiqc=join("vcf_concordance_mQC_Report.html"),
+
+rule multiqc:
+    input: 
+        expand(join(curr_dir, "hap.py_output", "{sharedID}_concordance.summary.csv"), sharedID = list(shared_samples)),
+    output: "vcf_concordance_mQC_Report.html"
+    params: patterns=config['references']['PATTERNS'], rname="multiqc"
+    shell: "module load multiqc/1.8; multiqc --interactive -c {params.patterns} -f -n {output} --interactive hap.py_output"
+
+###
+### Make single sample VCF
+###
+rule singlesample_vcf:
+    input:
+        ms_vcfcurr = currVCF,
+        ms_vcfold = oldVCF,
+    output:
+        ss_vcfcurr = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_curr.vcf.gz")),
+        ss_vcfold = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_old.vcf.gz")),
+        ss_vcicurr = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_curr.vcf.gz.tbi")),
+        ss_vciold = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_old.vcf.gz.tbi")),
+        ss_vcfcurr_AD = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_curr_AD.vcf")),
+        ss_vcfold_AD = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_old_AD.vcf")),
+        ss_vcfcurr_AD_idx = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_curr_AD.vcf.idx")),
+        ss_vcfold_AD_idx = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_old_AD.vcf.idx")),
+    params:
+    	rname = "singlesample_vcf",
+    	sample_id = "{sharedID}",
+        ss_vcf_dir = join(curr_dir, "single_sample_VCFs"),
+        genome = config['references']['GENOME'],
+        ss_vcfcurr_unzip = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_curr.vcf")),
+        ss_vcfold_unzip = temp(join(curr_dir, "single_sample_VCFs", "{sharedID}_old.vcf")),
+    shell:
+        """
+        module load bcftools/1.9
+        module load GATK/3.8-1
+        mkdir -p {params.ss_vcf_dir}
+        GATK -m 12g SelectVariants -R {params.genome} -o {output.ss_vcfcurr_AD} -V {input.ms_vcfcurr} --sample_name {params.sample_id} --ALLOW_NONOVERLAPPING_COMMAND_LINE_SAMPLES --excludeNonVariants
+        GATK -m 12g SelectVariants -R {params.genome} -o {output.ss_vcfold_AD} -V {input.ms_vcfold} --sample_name {params.sample_id} --ALLOW_NONOVERLAPPING_COMMAND_LINE_SAMPLES --excludeNonVariants
+        bcftools annotate -x FORMAT/AD -o {params.ss_vcfcurr_unzip} {output.ss_vcfcurr_AD}
+        bcftools annotate -x FORMAT/AD -o {params.ss_vcfold_unzip} {output.ss_vcfold_AD}
+        bgzip {params.ss_vcfcurr_unzip}
+        bgzip {params.ss_vcfold_unzip}
+        tabix -p vcf {output.ss_vcfcurr}
+        tabix -p vcf {output.ss_vcfold}
+        """
+
+###
+### Compare old/new full multisample VCF
+###
+rule vcf_concordance:
+    input: 
+        sample_vcfcurr = join(curr_dir, "single_sample_VCFs", "{sharedID}_curr.vcf.gz"),
+        sample_vcfold = join(curr_dir, "single_sample_VCFs", "{sharedID}_old.vcf.gz"),
+    output:
+        summary = join(curr_dir, "hap.py_output", "{sharedID}_concordance.summary.csv"),
+        extended = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.extended.csv")),
+        metrics = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.metrics.json.gz")),
+        roc_all = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.roc.all.csv.gz")),
+        roc_indel = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.roc.Locations.INDEL.csv.gz")),
+        roc_indel_pass = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.roc.Locations.INDEL.PASS.csv.gz")),
+        roc_snp = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.roc.Locations.SNP.csv.gz")),
+        roc_snp_pass = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.roc.Locations.SNP.PASS.csv.gz")),
+        run_info = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.runinfo.json")),
+        conc_vcf = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.vcf.gz")),
+        conc_vci = temp(join(curr_dir, "hap.py_output", "{sharedID}_concordance.vcf.gz.tbi")),
+    params:
+        rname = "vcf_concordance",
+        fname = join(curr_dir, "hap.py_output", "{sharedID}_concordance"),
+        genome = config['references']['GENOME'],
+        happy_dir = join(curr_dir, "hap.py_output"),
+    shell:
+        """
+        module load hap.py
+        mkdir -p {params.happy_dir}
+        hap.py {input.sample_vcfcurr} {input.sample_vcfold} -o {params.fname} -r {params.genome}
+        """
